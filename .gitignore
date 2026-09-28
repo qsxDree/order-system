@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output and test artifacts
+dist/
+build/
+coverage/
+dashboard/.next/
+dashboard/out/
+*.tsbuildinfo
+
+# Generated Prisma clients
+services/*/src/generated/prisma/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.*.example
+!**/.env.*.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling and operating system files
+.direnv/
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+*.md
+docs/
