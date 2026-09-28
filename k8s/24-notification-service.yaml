@@ -1,6 +1,6 @@
-# Build & load the Python image first:
-#   docker build -t ordersys-notification:latest ./services/notification-service
-#   kind load docker-image ordersys-notification:latest
+# Build & load the Go image first:
+#   docker build -t ordersys-notification-service:latest -f services/notification-service/Dockerfile .
+#   kind load docker-image ordersys-notification-service:latest
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: notification-service
-          image: ordersys-notification:latest
+          image: ordersys-notification-service:latest
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: { name: ordersys-config }
@@ -31,11 +31,11 @@ spec:
           ports: [{ containerPort: 4005 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 4005 }
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 5
           resources:
-            requests: { cpu: 50m, memory: 128Mi }
-            limits: { cpu: 300m, memory: 384Mi }
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

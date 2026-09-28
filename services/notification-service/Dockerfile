@@ -1,18 +1,18 @@
-FROM python:3.12-slim
+# Build stage
+FROM golang:alpine AS builder
+WORKDIR /workspace
 
+# Copy shared core library and service code
+COPY pkg/ ./pkg/
+COPY services/notification-service/ ./services/notification-service/
+
+WORKDIR /workspace/services/notification-service
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/server
+
+# Runtime stage
+FROM alpine:3.20
+RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
-
-COPY requirements.txt .
-
-RUN python -m pip install \
-    --no-cache-dir \
-    --timeout 180 \
-    --retries 10 \
-    --index-url https://pypi.org/simple \
-    -r requirements.txt
-
-COPY app ./app
-
+COPY --from=builder /app/server /app/server
 EXPOSE 4005
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "4005"]
+ENTRYPOINT ["/app/server"]

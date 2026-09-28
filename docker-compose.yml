@@ -1,23 +1,5 @@
 name: ordersys
 
-x-service-base: &service-base
-  build:
-    context: .
-    dockerfile: Dockerfile
-  restart: unless-stopped
-  depends_on:
-    postgres:
-      condition: service_healthy
-    rabbitmq:
-      condition: service_healthy
-    redis:
-      condition: service_healthy
-  environment: &service-env
-    NODE_ENV: development
-    LOG_LEVEL: info
-    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-    REDIS_URL: redis://redis:6379
-
 services:
   # ---------------- Infrastructure ----------------
   postgres:
@@ -57,15 +39,25 @@ services:
       timeout: 3s
       retries: 10
 
-  # ---------------- Application services ----------------
+  # ---------------- Go Application services ----------------
   order-service:
-    <<: *service-base
-    command: ["sh", "-c", "pnpm --filter @ordersys/order-service run db:push && pnpm dev:order"]
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      <<: *service-env
-      SERVICE_NAME: order-service
+      LOG_LEVEL: info
       ORDER_PORT: "4001"
       ORDER_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      REDIS_URL: redis://redis:6379
       INVENTORY_URL: http://inventory-service:4002
       PAYMENT_URL: http://payment-service:4003
       SHIPPING_URL: http://shipping-service:4004
@@ -75,42 +67,9 @@ services:
       - "4001:4001"
 
   inventory-service:
-    <<: *service-base
-    command: ["sh", "-c", "pnpm --filter @ordersys/inventory-service run db:push && pnpm dev:inventory"]
-    environment:
-      <<: *service-env
-      SERVICE_NAME: inventory-service
-      INVENTORY_PORT: "4002"
-      INVENTORY_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/inventory_db
-    ports:
-      - "4002:4002"
-
-  payment-service:
-    <<: *service-base
-    command: ["sh", "-c", "pnpm --filter @ordersys/payment-service run db:push && pnpm dev:payment"]
-    environment:
-      <<: *service-env
-      SERVICE_NAME: payment-service
-      PAYMENT_PORT: "4003"
-      PAYMENT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
-    ports:
-      - "4003:4003"
-
-  shipping-service:
-    <<: *service-base
-    command: ["sh", "-c", "pnpm --filter @ordersys/shipping-service run db:push && pnpm dev:shipping"]
-    environment:
-      <<: *service-env
-      SERVICE_NAME: shipping-service
-      SHIPPING_PORT: "4004"
-      SHIPPING_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/shipping_db
-    ports:
-      - "4004:4004"
-
-  notification-service:
     build:
-      context: ./services/notification-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
@@ -119,9 +78,64 @@ services:
         condition: service_healthy
     environment:
       LOG_LEVEL: info
+      INVENTORY_PORT: "4002"
+      INVENTORY_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/inventory_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      NOTIFICATION_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notification_db
+    ports:
+      - "4002:4002"
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: info
+      PAYMENT_PORT: "4003"
+      PAYMENT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "4003:4003"
+
+  shipping-service:
+    build:
+      context: .
+      dockerfile: services/shipping-service/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: info
+      SHIPPING_PORT: "4004"
+      SHIPPING_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/shipping_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      SHIPPING_DELIVERY_DELAY_SEC: "5"
+    ports:
+      - "4004:4004"
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: info
       NOTIFICATION_PORT: "4005"
+      NOTIFICATION_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notification_db
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
     ports:
       - "4005:4005"
 

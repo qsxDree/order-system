@@ -13,9 +13,8 @@ spec:
     spec:
       containers:
         - name: payment-service
-          image: ordersys:latest
+          image: ordersys-payment-service:latest
           imagePullPolicy: IfNotPresent
-          command: ["sh", "-c", "pnpm --filter @ordersys/payment-service run db:push && pnpm dev:payment"]
           envFrom:
             - configMapRef: { name: ordersys-config }
           env:
@@ -31,11 +30,11 @@ spec:
           ports: [{ containerPort: 4003 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 4003 }
-            initialDelaySeconds: 15
+            initialDelaySeconds: 5
             periodSeconds: 5
           resources:
-            requests: { cpu: 100m, memory: 160Mi }
-            limits: { cpu: 500m, memory: 512Mi }
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

@@ -1,0 +1,66 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "services/order-service/db/migrations"
+    queries: "services/order-service/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "services/order-service/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+
+  - engine: "postgresql"
+    schema: "services/inventory-service/db/migrations"
+    queries: "services/inventory-service/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "services/inventory-service/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+
+  - engine: "postgresql"
+    schema: "services/payment-service/db/migrations"
+    queries: "services/payment-service/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "services/payment-service/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+
+  - engine: "postgresql"
+    schema: "services/shipping-service/db/migrations"
+    queries: "services/shipping-service/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "services/shipping-service/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+
+  - engine: "postgresql"
+    schema: "services/notification-service/db/migrations"
+    queries: "services/notification-service/db/queries"
+    gen:
+      go:
+        package: "db"
+        out: "services/notification-service/internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false

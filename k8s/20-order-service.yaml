@@ -1,6 +1,6 @@
 # Build & load the image first (see k8s/README.md):
-#   docker build -t ordersys:latest .
-#   kind load docker-image ordersys:latest
+#   docker build -t ordersys-order-service:latest -f services/order-service/Dockerfile .
+#   kind load docker-image ordersys-order-service:latest
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,9 +16,8 @@ spec:
     spec:
       containers:
         - name: order-service
-          image: ordersys:latest
+          image: ordersys-order-service:latest
           imagePullPolicy: IfNotPresent
-          command: ["sh", "-c", "pnpm --filter @ordersys/order-service run db:push && pnpm dev:order"]
           envFrom:
             - configMapRef: { name: ordersys-config }
           env:
@@ -34,15 +33,15 @@ spec:
           ports: [{ containerPort: 4001 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 4001 }
-            initialDelaySeconds: 15
+            initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
             httpGet: { path: /healthz, port: 4001 }
-            initialDelaySeconds: 30
+            initialDelaySeconds: 10
             periodSeconds: 10
           resources:
-            requests: { cpu: 100m, memory: 160Mi }
-            limits: { cpu: 500m, memory: 512Mi }
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

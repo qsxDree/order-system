@@ -13,9 +13,8 @@ spec:
     spec:
       containers:
         - name: shipping-service
-          image: ordersys:latest
+          image: ordersys-shipping-service:latest
           imagePullPolicy: IfNotPresent
-          command: ["sh", "-c", "pnpm --filter @ordersys/shipping-service run db:push && pnpm dev:shipping"]
           envFrom:
             - configMapRef: { name: ordersys-config }
           env:
@@ -31,11 +30,11 @@ spec:
           ports: [{ containerPort: 4004 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 4004 }
-            initialDelaySeconds: 15
+            initialDelaySeconds: 5
             periodSeconds: 5
           resources:
-            requests: { cpu: 100m, memory: 160Mi }
-            limits: { cpu: 500m, memory: 512Mi }
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

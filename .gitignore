@@ -39,5 +39,10 @@ npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
 
-*.md
-docs/
+# Go artifacts
+bin/
+tmp/
+*.out
+*.test
+.air
+
