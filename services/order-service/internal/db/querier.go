@@ -14,16 +14,14 @@ type Querier interface {
 	CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error)
 	CreateOrderEvent(ctx context.Context, arg CreateOrderEventParams) (OrderEvent, error)
 	CreateOrderItem(ctx context.Context, arg CreateOrderItemParams) (OrderItem, error)
-	CreateOutbox(ctx context.Context, arg CreateOutboxParams) (Outbox, error)
 	GetOrder(ctx context.Context, id string) (Order, error)
 	ListOrderEvents(ctx context.Context, orderID string) ([]OrderEvent, error)
 	ListOrderItems(ctx context.Context, orderID string) ([]OrderItem, error)
 	ListOrders(ctx context.Context, arg ListOrdersParams) ([]Order, error)
-	MarkOutboxPublished(ctx context.Context, id string) error
-	PollUnpublishedOutbox(ctx context.Context, limit int32) ([]Outbox, error)
+	MarkOrderDelivered(ctx context.Context, id string) error
+	MarkOrderShipped(ctx context.Context, id string) error
 	UpdateOrderInventoryReserved(ctx context.Context, id string) (Order, error)
 	UpdateOrderPaymentSucceeded(ctx context.Context, id string) (Order, error)
-	UpdateOrderStatus(ctx context.Context, arg UpdateOrderStatusParams) (Order, error)
 }
 
 var _ Querier = (*Queries)(nil)

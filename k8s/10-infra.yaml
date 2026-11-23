@@ -1,4 +1,4 @@
-# PostgreSQL, RabbitMQ and Redis. Single-replica, ephemeral-ish stateful infra —
+# PostgreSQL and RabbitMQ. Single-replica, ephemeral-ish stateful infra —
 # fine for a demo cluster. In production these would be managed services or
 # operators (e.g. CloudNativePG, the RabbitMQ cluster operator).
 apiVersion: v1
@@ -91,30 +91,3 @@ spec:
   ports:
     - { name: amqp, port: 5672, targetPort: 5672 }
     - { name: mgmt, port: 15672, targetPort: 15672 }
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redis
-  namespace: ordersys
-spec:
-  replicas: 1
-  selector:
-    matchLabels: { app: redis }
-  template:
-    metadata:
-      labels: { app: redis }
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          ports: [{ containerPort: 6379 }]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: ordersys
-spec:
-  selector: { app: redis }
-  ports: [{ port: 6379, targetPort: 6379 }]

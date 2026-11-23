@@ -2,30 +2,31 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ordersys/pkg/bus"
 	"github.com/ordersys/pkg/events"
 	"github.com/ordersys/pkg/idempotency"
+	"github.com/ordersys/pkg/outbox"
 	"github.com/ordersys/services/shipping-service/internal/db"
 )
 
 type ShippingHandler struct {
 	pool         *pgxpool.Pool
-	bus          *bus.MessageBus
 	deliverAfter time.Duration
 	logger       *slog.Logger
 }
 
-func NewShippingHandler(pool *pgxpool.Pool, b *bus.MessageBus, deliverAfter time.Duration, logger *slog.Logger) *ShippingHandler {
+func NewShippingHandler(pool *pgxpool.Pool, deliverAfter time.Duration, logger *slog.Logger) *ShippingHandler {
 	return &ShippingHandler{
 		pool:         pool,
-		bus:          b,
 		deliverAfter: deliverAfter,
 		logger:       logger,
 	}
@@ -70,70 +71,75 @@ func (h *ShippingHandler) onOrderConfirmed(ctx context.Context, raw *events.RawE
 	trackingNumber := fmt.Sprintf("TRK-%s", strings.ToUpper(uuid.NewString()[:10]))
 	shipmentID := uuid.NewString()
 
-	shipment, err := queries.UpsertShipment(ctx, db.UpsertShipmentParams{
+	shipment, err := queries.CreateShipment(ctx, db.CreateShipmentParams{
 		ID:             shipmentID,
 		OrderID:        payload.OrderID,
 		Status:         "DISPATCHED",
 		TrackingNumber: trackingNumber,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to upsert shipment: %w", err)
+		return fmt.Errorf("failed to create shipment: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit dispatched shipment: %w", err)
+	if err := outbox.Enqueue(ctx, tx, payload.OrderID, events.TypeShipmentDispatched,
+		raw.CorrelationID, raw.MessageID, events.ShipmentDispatchedPayload{
+			OrderID: payload.OrderID, TrackingNumber: shipment.TrackingNumber,
+		}); err != nil {
+		return err
 	}
-
-	opts := bus.PublishOptions{
-		CorrelationID: raw.CorrelationID,
-		CausationID:   raw.MessageID,
-	}
-
-	_, pubErr := h.bus.Publish(ctx, events.TypeShipmentDispatched, events.ShipmentDispatchedPayload{
-		OrderID:        payload.OrderID,
-		TrackingNumber: shipment.TrackingNumber,
-	}, opts)
-	if pubErr != nil {
-		return fmt.Errorf("failed to publish shipment.dispatched: %w", pubErr)
-	}
-
-	h.logger.InfoContext(ctx, "shipment dispatched 📦", "orderId", payload.OrderID, "trackingNumber", shipment.TrackingNumber)
-
-	// Simulate transit -> delivery background task
-	orderID := payload.OrderID
-	corrID := raw.CorrelationID
-	go func() {
-		time.Sleep(h.deliverAfter)
-		deliverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-
-		if err := h.deliver(deliverCtx, orderID, corrID); err != nil {
-			h.logger.Error("delivery simulation failed", "orderId", orderID, "err", err)
-		}
-	}()
-
-	return nil
+	return tx.Commit(ctx)
 }
 
-func (h *ShippingHandler) deliver(ctx context.Context, orderID string, correlationID string) error {
-	queries := db.New(h.pool)
-	_, err := queries.UpdateShipmentStatus(ctx, db.UpdateShipmentStatusParams{
-		Status:  "DELIVERED",
-		OrderID: orderID,
+// StartDeliveries resumes dispatched shipments from the database after a restart.
+func (h *ShippingHandler) StartDeliveries(ctx context.Context) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				workCtx, stop := context.WithTimeout(ctx, 10*time.Second)
+				if err := h.deliverDue(workCtx); err != nil && ctx.Err() == nil {
+					h.logger.ErrorContext(ctx, "delivery simulation failed", "err", err)
+				}
+				stop()
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
+}
+
+func (h *ShippingHandler) deliverDue(ctx context.Context) error {
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	shipments, err := queries.ListDueShipments(ctx, pgtype.Timestamptz{
+		Time: time.Now().Add(-h.deliverAfter), Valid: true,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to update shipment to DELIVERED: %w", err)
+		return err
 	}
-
-	_, err = h.bus.Publish(ctx, events.TypeShipmentDelivered, events.ShipmentDeliveredPayload{
-		OrderID: orderID,
-	}, bus.PublishOptions{
-		CorrelationID: correlationID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to publish shipment.delivered: %w", err)
+	for _, shipment := range shipments {
+		if _, err := queries.UpdateShipmentStatus(ctx, db.UpdateShipmentStatusParams{
+			OrderID: shipment.OrderID, Status: "DELIVERED",
+		}); err != nil {
+			return err
+		}
+		if err := outbox.Enqueue(ctx, tx, shipment.OrderID, events.TypeShipmentDelivered,
+			shipment.OrderID, "", events.ShipmentDeliveredPayload{OrderID: shipment.OrderID}); err != nil {
+			return err
+		}
 	}
-
-	h.logger.Info("shipment delivered ✅", "orderId", orderID)
-	return nil
+	return tx.Commit(ctx)
 }

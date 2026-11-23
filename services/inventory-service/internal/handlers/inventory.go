@@ -5,32 +5,31 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ordersys/pkg/bus"
 	"github.com/ordersys/pkg/events"
 	"github.com/ordersys/pkg/idempotency"
+	"github.com/ordersys/pkg/outbox"
 	"github.com/ordersys/services/inventory-service/internal/db"
 )
 
 type InventoryHandler struct {
 	pool   *pgxpool.Pool
-	bus    *bus.MessageBus
 	logger *slog.Logger
 }
 
-func NewInventoryHandler(pool *pgxpool.Pool, b *bus.MessageBus, logger *slog.Logger) *InventoryHandler {
+func NewInventoryHandler(pool *pgxpool.Pool, logger *slog.Logger) *InventoryHandler {
 	return &InventoryHandler{
 		pool:   pool,
-		bus:    b,
 		logger: logger,
 	}
 }
 
-// InsufficientStockError indicates stock reservation failed due to low quantity or simulation.
+// InsufficientStockError rejects an order without retaining partial reservations.
 type InsufficientStockError struct {
 	Reason string
 }
@@ -78,101 +77,93 @@ func (h *InventoryHandler) onOrderCreated(ctx context.Context, raw *events.RawEn
 	}
 
 	queries := db.New(tx)
-	opts := bus.PublishOptions{
-		CorrelationID: raw.CorrelationID,
-		CausationID:   raw.MessageID,
+	if err := queries.LockOrder(ctx, payload.OrderID); err != nil {
+		return err
+	}
+	cancelled, err := queries.IsOrderCancelled(ctx, payload.OrderID)
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		return tx.Commit(ctx)
 	}
 
-	// Failure simulation toggle
-	if payload.Simulate != nil && payload.Simulate.OutOfStock {
-		reason := "simulated out-of-stock (demo toggle)"
-		if err := tx.Commit(ctx); err != nil {
+	// A savepoint keeps the processed-message marker while rolling back every partial reservation.
+	reservationTx, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	err = h.reserve(ctx, db.New(reservationTx), payload)
+	var stockErr *InsufficientStockError
+	if errors.As(err, &stockErr) {
+		if err := reservationTx.Rollback(ctx); err != nil {
 			return err
 		}
-		_, pubErr := h.bus.Publish(ctx, events.TypeInventoryRejected, events.InventoryRejectedPayload{
-			OrderID: payload.OrderID,
-			Reason:  reason,
-		}, opts)
-		h.logger.WarnContext(ctx, "inventory rejected (simulated)", "orderId", payload.OrderID)
-		return pubErr
+		if err := outbox.Enqueue(ctx, tx, payload.OrderID, events.TypeInventoryRejected,
+			raw.CorrelationID, raw.MessageID, events.InventoryRejectedPayload{
+				OrderID: payload.OrderID, Reason: stockErr.Reason,
+			}); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if err := reservationTx.Commit(ctx); err != nil {
+		return err
 	}
 
-	// Attempt stock reservation
-	for _, item := range payload.Items {
+	if err := outbox.Enqueue(ctx, tx, payload.OrderID, events.TypeInventoryReserved,
+		raw.CorrelationID, raw.MessageID, events.InventoryReservedPayload{
+			OrderID: payload.OrderID, ReservationID: payload.OrderID,
+		}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (h *InventoryHandler) reserve(ctx context.Context, queries *db.Queries, payload events.OrderCreatedPayload) error {
+	if payload.Simulate != nil && payload.Simulate.OutOfStock {
+		return &InsufficientStockError{Reason: "simulated out-of-stock (demo toggle)"}
+	}
+
+	items := slices.Clone(payload.Items)
+	slices.SortFunc(items, func(a, b events.OrderItem) int { return strings.Compare(a.ProductID, b.ProductID) })
+	for _, item := range items {
 		inv, err := queries.GetInventoryForUpdate(ctx, item.ProductID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Auto-create product and initial stock for unknown items
-			var priceNum pgtype.Numeric
-			_ = priceNum.Scan(fmt.Sprintf("%.2f", item.UnitPrice))
-			_, _ = queries.UpsertProduct(ctx, db.UpsertProductParams{
-				ID:    item.ProductID,
-				Sku:   item.SKU,
-				Name:  item.SKU,
-				Price: priceNum,
-			})
-			inv, err = queries.UpsertInventory(ctx, db.UpsertInventoryParams{
-				ProductID: item.ProductID,
-				Available: 100,
-				Reserved:  0,
-			})
+			return &InsufficientStockError{Reason: fmt.Sprintf("unknown product %s", item.ProductID)}
 		}
 		if err != nil {
 			return fmt.Errorf("failed to lock inventory for product %s: %w", item.ProductID, err)
 		}
-
-		if item.Quantity <= 0 || item.Quantity > 1_000_000 {
-			return fmt.Errorf("invalid quantity: %d", item.Quantity)
+		price, err := inv.Price.Float64Value()
+		if err != nil {
+			return fmt.Errorf("failed to read catalog price: %w", err)
 		}
-		itemQty := int32(item.Quantity) //nolint:gosec // bounded above
-
-		if inv.Available < itemQty {
-			reason := fmt.Sprintf("insufficient stock for %s (need %d, have %d)", item.SKU, item.Quantity, inv.Available)
-			if err := tx.Commit(ctx); err != nil {
-				return err
-			}
-			_, pubErr := h.bus.Publish(ctx, events.TypeInventoryRejected, events.InventoryRejectedPayload{
-				OrderID: payload.OrderID,
-				Reason:  reason,
-			}, opts)
-			h.logger.WarnContext(ctx, "inventory rejected", "orderId", payload.OrderID, "reason", reason)
-			return pubErr
+		if item.SKU != inv.Sku || item.UnitPrice != price.Float64 {
+			return &InsufficientStockError{Reason: fmt.Sprintf("catalog details changed for product %s", item.ProductID)}
 		}
-
-		// Deduct available & increment reserved
+		quantity := int32(item.Quantity) //nolint:gosec // UnmarshalPayload bounds quantities to 1,000,000.
+		if inv.Available < quantity {
+			return &InsufficientStockError{Reason: fmt.Sprintf("insufficient stock for %s (need %d, have %d)",
+				item.SKU, item.Quantity, inv.Available)}
+		}
 		_, err = queries.ReserveStock(ctx, db.ReserveStockParams{
-			Available: itemQty,
-			ProductID: item.ProductID,
+			Available: quantity, ProductID: item.ProductID,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to reserve stock for product %s: %w", item.ProductID, err)
+			return fmt.Errorf("failed to reserve stock: %w", err)
 		}
-
-		// Record reservation
 		_, err = queries.CreateReservation(ctx, db.CreateReservationParams{
-			ID:        uuid.NewString(),
-			OrderID:   payload.OrderID,
-			ProductID: item.ProductID,
-			Quantity:  itemQty,
-			Status:    "HELD",
+			ID: uuid.NewString(), OrderID: payload.OrderID, ProductID: item.ProductID,
+			Quantity: quantity, Status: "HELD",
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create reservation record: %w", err)
+			return fmt.Errorf("failed to create reservation: %w", err)
 		}
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit reservation: %w", err)
-	}
-
-	_, pubErr := h.bus.Publish(ctx, events.TypeInventoryReserved, events.InventoryReservedPayload{
-		OrderID:       payload.OrderID,
-		ReservationID: payload.OrderID,
-	}, opts)
-	if pubErr != nil {
-		return fmt.Errorf("failed to publish inventory.reserved: %w", pubErr)
-	}
-
-	h.logger.InfoContext(ctx, "inventory reserved", "orderId", payload.OrderID, "items", len(payload.Items))
 	return nil
 }
 
@@ -202,6 +193,12 @@ func (h *InventoryHandler) onOrderCancelled(ctx context.Context, raw *events.Raw
 	}
 
 	queries := db.New(tx)
+	if err := queries.LockOrder(ctx, payload.OrderID); err != nil {
+		return err
+	}
+	if err := queries.MarkOrderCancelled(ctx, payload.OrderID); err != nil {
+		return err
+	}
 	held, err := queries.ListHeldReservations(ctx, payload.OrderID)
 	if err != nil {
 		return fmt.Errorf("failed to list held reservations: %w", err)

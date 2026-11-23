@@ -22,7 +22,6 @@ pkgs.mkShell {
     docker
     docker-compose
     postgresql_16
-    redis
     kubectl
     kind
 

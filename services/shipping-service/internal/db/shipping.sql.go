@@ -7,14 +7,34 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getShipmentByOrderID = `-- name: GetShipmentByOrderID :one
-SELECT id, order_id, status, tracking_number, created_at, updated_at FROM shipments WHERE order_id = $1 LIMIT 1
+const createShipment = `-- name: CreateShipment :one
+INSERT INTO shipments (
+    id, order_id, status, tracking_number, created_at, updated_at
+) VALUES (
+    $1, $2, $3, $4, NOW(), NOW()
+)
+ON CONFLICT (order_id) DO NOTHING
+RETURNING id, order_id, status, tracking_number, created_at, updated_at
 `
 
-func (q *Queries) GetShipmentByOrderID(ctx context.Context, orderID string) (Shipment, error) {
-	row := q.db.QueryRow(ctx, getShipmentByOrderID, orderID)
+type CreateShipmentParams struct {
+	ID             string `json:"id"`
+	OrderID        string `json:"order_id"`
+	Status         string `json:"status"`
+	TrackingNumber string `json:"tracking_number"`
+}
+
+func (q *Queries) CreateShipment(ctx context.Context, arg CreateShipmentParams) (Shipment, error) {
+	row := q.db.QueryRow(ctx, createShipment,
+		arg.ID,
+		arg.OrderID,
+		arg.Status,
+		arg.TrackingNumber,
+	)
 	var i Shipment
 	err := row.Scan(
 		&i.ID,
@@ -25,6 +45,40 @@ func (q *Queries) GetShipmentByOrderID(ctx context.Context, orderID string) (Shi
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const listDueShipments = `-- name: ListDueShipments :many
+SELECT id, order_id, status, tracking_number, created_at, updated_at FROM shipments
+WHERE status = 'DISPATCHED' AND updated_at <= $1
+ORDER BY updated_at, id LIMIT 50
+FOR UPDATE SKIP LOCKED
+`
+
+func (q *Queries) ListDueShipments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]Shipment, error) {
+	rows, err := q.db.Query(ctx, listDueShipments, updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Shipment
+	for rows.Next() {
+		var i Shipment
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrderID,
+			&i.Status,
+			&i.TrackingNumber,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateShipmentStatus = `-- name: UpdateShipmentStatus :one
@@ -41,43 +95,6 @@ type UpdateShipmentStatusParams struct {
 
 func (q *Queries) UpdateShipmentStatus(ctx context.Context, arg UpdateShipmentStatusParams) (Shipment, error) {
 	row := q.db.QueryRow(ctx, updateShipmentStatus, arg.OrderID, arg.Status)
-	var i Shipment
-	err := row.Scan(
-		&i.ID,
-		&i.OrderID,
-		&i.Status,
-		&i.TrackingNumber,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const upsertShipment = `-- name: UpsertShipment :one
-INSERT INTO shipments (
-    id, order_id, status, tracking_number, created_at, updated_at
-) VALUES (
-    $1, $2, $3, $4, NOW(), NOW()
-)
-ON CONFLICT (order_id) DO UPDATE
-SET status = EXCLUDED.status, updated_at = NOW()
-RETURNING id, order_id, status, tracking_number, created_at, updated_at
-`
-
-type UpsertShipmentParams struct {
-	ID             string `json:"id"`
-	OrderID        string `json:"order_id"`
-	Status         string `json:"status"`
-	TrackingNumber string `json:"tracking_number"`
-}
-
-func (q *Queries) UpsertShipment(ctx context.Context, arg UpsertShipmentParams) (Shipment, error) {
-	row := q.db.QueryRow(ctx, upsertShipment,
-		arg.ID,
-		arg.OrderID,
-		arg.Status,
-		arg.TrackingNumber,
-	)
 	var i Shipment
 	err := row.Scan(
 		&i.ID,

@@ -24,14 +24,6 @@ INSERT INTO order_events (
 )
 RETURNING *;
 
--- name: CreateOutbox :one
-INSERT INTO outbox (
-    id, aggregate_id, type, payload, correlation_id, causation_id, published, created_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, false, NOW()
-)
-RETURNING *;
-
 -- name: GetOrder :one
 SELECT * FROM orders WHERE id = $1 LIMIT 1;
 
@@ -71,20 +63,10 @@ SET status = 'CANCELLED', cancellation_reason = $2, updated_at = NOW()
 WHERE id = $1 AND status = 'PENDING'
 RETURNING *;
 
--- name: UpdateOrderStatus :one
-UPDATE orders
-SET status = $2, updated_at = NOW()
-WHERE id = $1 AND status = $3
-RETURNING *;
+-- name: MarkOrderShipped :exec
+UPDATE orders SET status = 'SHIPPED', updated_at = NOW()
+WHERE id = $1 AND status = 'CONFIRMED';
 
--- name: PollUnpublishedOutbox :many
-SELECT * FROM outbox
-WHERE published = false
-ORDER BY created_at ASC
-LIMIT $1
-FOR UPDATE SKIP LOCKED;
-
--- name: MarkOutboxPublished :exec
-UPDATE outbox
-SET published = true
-WHERE id = $1;
+-- name: MarkOrderDelivered :exec
+UPDATE orders SET status = 'DELIVERED', updated_at = NOW()
+WHERE id = $1 AND status IN ('CONFIRMED', 'SHIPPED');

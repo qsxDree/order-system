@@ -46,7 +46,7 @@ func SeedProducts(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) 
 			return fmt.Errorf("failed to upsert product %s: %w", item.SKU, err)
 		}
 
-		_, err = queries.UpsertInventory(ctx, db.UpsertInventoryParams{
+		err = queries.SeedInventory(ctx, db.SeedInventoryParams{
 			ProductID: item.ID,
 			Available: item.Stock,
 			Reserved:  0,

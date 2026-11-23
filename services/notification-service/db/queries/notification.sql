@@ -5,8 +5,3 @@ INSERT INTO notifications (
     $1, $2, $3, 'SENT', NOW()
 )
 RETURNING *;
-
--- name: ListNotificationsByOrderID :many
-SELECT * FROM notifications
-WHERE order_id = $1
-ORDER BY sent_at DESC;

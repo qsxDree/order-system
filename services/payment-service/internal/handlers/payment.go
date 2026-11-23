@@ -4,27 +4,24 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ordersys/pkg/bus"
 	"github.com/ordersys/pkg/events"
 	"github.com/ordersys/pkg/idempotency"
+	"github.com/ordersys/pkg/outbox"
 	"github.com/ordersys/services/payment-service/internal/db"
 )
 
 type PaymentHandler struct {
 	pool   *pgxpool.Pool
-	bus    *bus.MessageBus
 	logger *slog.Logger
 }
 
-func NewPaymentHandler(pool *pgxpool.Pool, b *bus.MessageBus, logger *slog.Logger) *PaymentHandler {
+func NewPaymentHandler(pool *pgxpool.Pool, logger *slog.Logger) *PaymentHandler {
 	return &PaymentHandler{
 		pool:   pool,
-		bus:    b,
 		logger: logger,
 	}
 }
@@ -67,81 +64,51 @@ func (h *PaymentHandler) onOrderCreated(ctx context.Context, raw *events.RawEnve
 	}
 
 	queries := db.New(tx)
-	paymentID := uuid.NewString()
+	if err := queries.LockOrder(ctx, payload.OrderID); err != nil {
+		return err
+	}
+	cancelled, err := queries.IsOrderCancelled(ctx, payload.OrderID)
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		return tx.Commit(ctx)
+	}
 
-	var amtNum pgtype.Numeric
-	_ = amtNum.Scan(fmt.Sprintf("%.2f", payload.TotalAmount))
-
+	var amount pgtype.Numeric
+	if err := amount.Scan(fmt.Sprintf("%.2f", payload.TotalAmount)); err != nil {
+		return fmt.Errorf("invalid payment amount: %w", err)
+	}
 	payment, err := queries.CreatePayment(ctx, db.CreatePaymentParams{
-		ID:      paymentID,
-		OrderID: payload.OrderID,
-		Amount:  amtNum,
+		ID: uuid.NewString(), OrderID: payload.OrderID, Amount: amount,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create pending payment: %w", err)
+		return fmt.Errorf("failed to create payment: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit initial payment record: %w", err)
+	status := db.UpdatePaymentStatusParams{
+		ID: payment.ID, Status: "SUCCEEDED",
+		ProviderRef: pgtype.Text{String: "ch_" + uuid.NewString()[:12], Valid: true},
 	}
-
-	// Simulate provider latency (150ms)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(150 * time.Millisecond):
+	eventType := events.TypePaymentSucceeded
+	var result any = events.PaymentSucceededPayload{
+		OrderID: payload.OrderID, PaymentID: payment.ID, Amount: payload.TotalAmount,
 	}
-
-	opts := bus.PublishOptions{
-		CorrelationID: raw.CorrelationID,
-		CausationID:   raw.MessageID,
-	}
-
-	queriesPool := db.New(h.pool)
-
-	// Simulated failure
 	if payload.Simulate != nil && payload.Simulate.PaymentFailure {
-		_, err := queriesPool.UpdatePaymentStatus(ctx, db.UpdatePaymentStatusParams{
-			ID:          payment.ID,
-			Status:      "FAILED",
-			ProviderRef: pgtype.Text{Valid: false},
-			FailureCode: pgtype.Text{String: "card_declined", Valid: true},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to update payment to FAILED: %w", err)
-		}
-
-		_, pubErr := h.bus.Publish(ctx, events.TypePaymentFailed, events.PaymentFailedPayload{
-			OrderID: payload.OrderID,
-			Reason:  "card declined (demo toggle)",
-		}, opts)
-		h.logger.WarnContext(ctx, "payment failed (simulated)", "orderId", payload.OrderID, "paymentId", payment.ID)
-		return pubErr
+		status.Status = "FAILED"
+		status.ProviderRef = pgtype.Text{}
+		status.FailureCode = pgtype.Text{String: "card_declined", Valid: true}
+		eventType = events.TypePaymentFailed
+		result = events.PaymentFailedPayload{OrderID: payload.OrderID, Reason: "card declined (demo toggle)"}
 	}
-
-	// Succeeded
-	providerRef := fmt.Sprintf("ch_%s", uuid.NewString()[:12])
-	_, err = queriesPool.UpdatePaymentStatus(ctx, db.UpdatePaymentStatusParams{
-		ID:          payment.ID,
-		Status:      "SUCCEEDED",
-		ProviderRef: pgtype.Text{String: providerRef, Valid: true},
-		FailureCode: pgtype.Text{Valid: false},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to update payment to SUCCEEDED: %w", err)
+	if _, err := queries.UpdatePaymentStatus(ctx, status); err != nil {
+		return fmt.Errorf("failed to finalize payment: %w", err)
 	}
-
-	_, pubErr := h.bus.Publish(ctx, events.TypePaymentSucceeded, events.PaymentSucceededPayload{
-		OrderID:   payload.OrderID,
-		PaymentID: payment.ID,
-		Amount:    payload.TotalAmount,
-	}, opts)
-	if pubErr != nil {
-		return fmt.Errorf("failed to publish payment.succeeded: %w", pubErr)
+	if err := outbox.Enqueue(ctx, tx, payload.OrderID, eventType,
+		raw.CorrelationID, raw.MessageID, result); err != nil {
+		return err
 	}
-
-	h.logger.InfoContext(ctx, "payment succeeded", "orderId", payload.OrderID, "paymentId", payment.ID, "amount", payload.TotalAmount)
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (h *PaymentHandler) onOrderCancelled(ctx context.Context, raw *events.RawEnvelope) error {
@@ -170,6 +137,12 @@ func (h *PaymentHandler) onOrderCancelled(ctx context.Context, raw *events.RawEn
 	}
 
 	queries := db.New(tx)
+	if err := queries.LockOrder(ctx, payload.OrderID); err != nil {
+		return err
+	}
+	if err := queries.MarkOrderCancelled(ctx, payload.OrderID); err != nil {
+		return err
+	}
 	refunded, err := queries.RefundPaymentByOrderID(ctx, payload.OrderID)
 	if err != nil {
 		return fmt.Errorf("failed to refund payment: %w", err)

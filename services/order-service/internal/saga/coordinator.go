@@ -3,16 +3,18 @@ package saga
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ordersys/pkg/events"
 	"github.com/ordersys/pkg/idempotency"
+	"github.com/ordersys/pkg/outbox"
 	"github.com/ordersys/services/order-service/internal/db"
-	"github.com/ordersys/services/order-service/internal/outbox"
 )
 
 type Coordinator struct {
@@ -50,11 +52,11 @@ func (s *Coordinator) HandleMessage(ctx context.Context, raw *events.RawEnvelope
 func (s *Coordinator) recordEvent(ctx context.Context, tx db.DBTX, raw *events.RawEnvelope, orderID string) error {
 	queries := db.New(tx)
 	_, err := queries.CreateOrderEvent(ctx, db.CreateOrderEventParams{
-		ID:        uuid.NewString(),
-		OrderID:   orderID,
-		Type:      raw.Type,
-		Producer:  raw.Producer,
-		Payload:   raw.Data,
+		ID:       uuid.NewString(),
+		OrderID:  orderID,
+		Type:     raw.Type,
+		Producer: raw.Producer,
+		Payload:  raw.Data,
 	})
 	return err
 }
@@ -135,23 +137,25 @@ func (s *Coordinator) onPaymentSucceeded(ctx context.Context, raw *events.RawEnv
 	return tx.Commit(ctx)
 }
 
-func (s *Coordinator) maybeConfirm(ctx context.Context, tx db.DBTX, orderID, correlationID, causationID string) error {
+func (s *Coordinator) maybeConfirm(ctx context.Context, tx pgx.Tx, orderID, correlationID, causationID string) error {
 	queries := db.New(tx)
 	confirmed, err := queries.ConfirmOrder(ctx, orderID)
-	if err != nil {
-		// Not yet ready to confirm or already confirmed
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to confirm order: %w", err)
 	}
 
 	confirmPayload := events.OrderConfirmedPayload{OrderID: orderID}
 	payloadBytes, _ := json.Marshal(confirmPayload)
 
 	_, err = queries.CreateOrderEvent(ctx, db.CreateOrderEventParams{
-		ID:        uuid.NewString(),
-		OrderID:   orderID,
-		Type:      events.TypeOrderConfirmed,
-		Producer:  "order-service",
-		Payload:   payloadBytes,
+		ID:       uuid.NewString(),
+		OrderID:  orderID,
+		Type:     events.TypeOrderConfirmed,
+		Producer: "order-service",
+		Payload:  payloadBytes,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to record confirmed order event: %w", err)
@@ -210,20 +214,22 @@ func (s *Coordinator) cancelOrder(ctx context.Context, raw *events.RawEnvelope, 
 		ID:                 orderID,
 		CancellationReason: pgtype.Text{String: reason, Valid: true},
 	})
-	if err != nil {
-		// Already resolved / not pending
+	if errors.Is(err, pgx.ErrNoRows) {
 		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to cancel order: %w", err)
 	}
 
 	cancelPayload := events.OrderCancelledPayload{OrderID: orderID, Reason: reason}
 	payloadBytes, _ := json.Marshal(cancelPayload)
 
 	_, err = queries.CreateOrderEvent(ctx, db.CreateOrderEventParams{
-		ID:        uuid.NewString(),
-		OrderID:   orderID,
-		Type:      events.TypeOrderCancelled,
-		Producer:  "order-service",
-		Payload:   payloadBytes,
+		ID:       uuid.NewString(),
+		OrderID:  orderID,
+		Type:     events.TypeOrderCancelled,
+		Producer: "order-service",
+		Payload:  payloadBytes,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to record cancelled order event: %w", err)
@@ -264,11 +270,9 @@ func (s *Coordinator) onShipmentDispatched(ctx context.Context, raw *events.RawE
 	}
 
 	queries := db.New(tx)
-	_, _ = queries.UpdateOrderStatus(ctx, db.UpdateOrderStatusParams{
-		ID:     payload.OrderID,
-		Status: "SHIPPED",
-		Status_2: "CONFIRMED",
-	})
+	if err := queries.MarkOrderShipped(ctx, payload.OrderID); err != nil {
+		return fmt.Errorf("failed to update order status: %w", err)
+	}
 
 	return tx.Commit(ctx)
 }
@@ -299,11 +303,9 @@ func (s *Coordinator) onShipmentDelivered(ctx context.Context, raw *events.RawEn
 	}
 
 	queries := db.New(tx)
-	_, _ = queries.UpdateOrderStatus(ctx, db.UpdateOrderStatusParams{
-		ID:     payload.OrderID,
-		Status: "DELIVERED",
-		Status_2: "SHIPPED",
-	})
+	if err := queries.MarkOrderDelivered(ctx, payload.OrderID); err != nil {
+		return fmt.Errorf("failed to update order status: %w", err)
+	}
 
 	return tx.Commit(ctx)
 }

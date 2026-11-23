@@ -11,7 +11,6 @@ metadata:
 data:
   RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
   RABBITMQ_MGMT_URL: http://rabbitmq:15672
-  REDIS_URL: redis://redis:6379
   INVENTORY_URL: http://inventory-service:4002
   PAYMENT_URL: http://payment-service:4003
   SHIPPING_URL: http://shipping-service:4004

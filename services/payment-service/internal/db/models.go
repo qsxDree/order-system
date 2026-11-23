@@ -8,6 +8,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type OrderCancellation struct {
+	OrderID string `json:"order_id"`
+}
+
+type Outbox struct {
+	ID            string             `json:"id"`
+	AggregateID   string             `json:"aggregate_id"`
+	Type          string             `json:"type"`
+	Payload       []byte             `json:"payload"`
+	CorrelationID string             `json:"correlation_id"`
+	CausationID   pgtype.Text        `json:"causation_id"`
+	Published     bool               `json:"published"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
 type Payment struct {
 	ID          string             `json:"id"`
 	OrderID     string             `json:"order_id"`

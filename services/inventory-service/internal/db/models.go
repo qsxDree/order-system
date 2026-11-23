@@ -14,6 +14,21 @@ type Inventory struct {
 	Reserved  int32  `json:"reserved"`
 }
 
+type OrderCancellation struct {
+	OrderID string `json:"order_id"`
+}
+
+type Outbox struct {
+	ID            string             `json:"id"`
+	AggregateID   string             `json:"aggregate_id"`
+	Type          string             `json:"type"`
+	Payload       []byte             `json:"payload"`
+	CorrelationID string             `json:"correlation_id"`
+	CausationID   pgtype.Text        `json:"causation_id"`
+	Published     bool               `json:"published"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
 type ProcessedMessage struct {
 	ID          string             `json:"id"`
 	Type        string             `json:"type"`

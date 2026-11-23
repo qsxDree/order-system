@@ -9,30 +9,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ordersys/pkg/bus"
-	"github.com/ordersys/services/order-service/internal/db"
 )
 
 // Enqueue appends an event to the outbox table inside an existing transaction.
-func Enqueue(ctx context.Context, tx db.DBTX, aggregateID, eventType, correlationID string, causationID string, payload any) error {
+func Enqueue(ctx context.Context, tx pgx.Tx, aggregateID, eventType, correlationID string, causationID string, payload any) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal outbox payload: %w", err)
 	}
 
-	queries := db.New(tx)
-	caus := pgtype.Text{String: causationID, Valid: causationID != ""}
-
-	_, err = queries.CreateOutbox(ctx, db.CreateOutboxParams{
-		ID:            uuid.NewString(),
-		AggregateID:   aggregateID,
-		Type:          eventType,
-		Payload:       payloadBytes,
-		CorrelationID: correlationID,
-		CausationID:   caus,
-	})
+	_, err = tx.Exec(ctx, `INSERT INTO outbox
+		(id, aggregate_id, type, payload, correlation_id, causation_id)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		uuid.NewString(), aggregateID, eventType, payloadBytes, correlationID,
+		pgtype.Text{String: causationID, Valid: causationID != ""})
 	if err != nil {
 		return fmt.Errorf("failed to enqueue outbox event: %w", err)
 	}
@@ -40,9 +34,13 @@ func Enqueue(ctx context.Context, tx db.DBTX, aggregateID, eventType, correlatio
 }
 
 // Relay polls the outbox periodically and forwards unpublished events to RabbitMQ.
+type Publisher interface {
+	Publish(context.Context, string, any, ...bus.PublishOptions) (string, error)
+}
+
 type Relay struct {
 	pool    *pgxpool.Pool
-	bus     *bus.MessageBus
+	bus     Publisher
 	logger  *slog.Logger
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
@@ -50,12 +48,11 @@ type Relay struct {
 	mu      sync.Mutex
 }
 
-func NewRelay(pool *pgxpool.Pool, b *bus.MessageBus, logger *slog.Logger) *Relay {
+func NewRelay(pool *pgxpool.Pool, b Publisher, logger *slog.Logger) *Relay {
 	return &Relay{
 		pool:   pool,
 		bus:    b,
 		logger: logger,
-		stopCh: make(chan struct{}),
 	}
 }
 
@@ -70,24 +67,23 @@ func (r *Relay) Start(interval time.Duration) {
 		return
 	}
 	r.running = true
-	r.mu.Unlock()
-
+	r.stopCh = make(chan struct{})
 	r.wg.Add(1)
 	go r.loop(interval)
+	r.mu.Unlock()
 	r.logger.Info("outbox relay started", "interval", interval.String())
 }
 
 func (r *Relay) Stop() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.running {
-		r.mu.Unlock()
 		return
 	}
-	r.running = false
 	close(r.stopCh)
-	r.mu.Unlock()
 
 	r.wg.Wait()
+	r.running = false
 	r.logger.Info("outbox relay stopped")
 }
 
@@ -117,36 +113,40 @@ func (r *Relay) flush(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	queries := db.New(tx)
-	rows, err := queries.PollUnpublishedOutbox(ctx, 50)
+	rows, err := tx.Query(ctx, `SELECT id, type, payload, correlation_id, causation_id
+		FROM outbox WHERE published = false ORDER BY created_at, id
+		LIMIT 50 FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		return fmt.Errorf("failed to poll unpublished outbox: %w", err)
 	}
 
-	for _, row := range rows {
-		var payload any
-		if err := json.Unmarshal(row.Payload, &payload); err != nil {
-			r.logger.Error("corrupt outbox payload, skipping", "id", row.ID, "err", err)
-			continue
-		}
+	type event struct {
+		id, eventType, correlationID string
+		payload                      json.RawMessage
+		causationID                  pgtype.Text
+	}
+	batch, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (event, error) {
+		var e event
+		err := row.Scan(&e.id, &e.eventType, &e.payload, &e.correlationID, &e.causationID)
+		return e, err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to read outbox: %w", err)
+	}
 
-		causationID := ""
-		if row.CausationID.Valid {
-			causationID = row.CausationID.String
-		}
-
+	for _, row := range batch {
 		opts := bus.PublishOptions{
-			MessageID:     row.ID,
-			CorrelationID: row.CorrelationID,
-			CausationID:   causationID,
+			MessageID:     row.id,
+			CorrelationID: row.correlationID,
+			CausationID:   row.causationID.String,
 		}
 
-		_, err = r.bus.Publish(ctx, row.Type, payload, opts)
+		_, err = r.bus.Publish(ctx, row.eventType, row.payload, opts)
 		if err != nil {
-			return fmt.Errorf("failed to publish outbox event %s: %w", row.ID, err)
+			return fmt.Errorf("failed to publish outbox event %s: %w", row.id, err)
 		}
 
-		if err := queries.MarkOutboxPublished(ctx, row.ID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE outbox SET published = true WHERE id = $1`, row.id); err != nil {
 			return fmt.Errorf("failed to mark outbox as published: %w", err)
 		}
 	}
@@ -155,8 +155,8 @@ func (r *Relay) flush(ctx context.Context) error {
 		return fmt.Errorf("failed to commit outbox flush: %w", err)
 	}
 
-	if len(rows) > 0 {
-		r.logger.Debug("outbox flushed", "count", len(rows))
+	if len(batch) > 0 {
+		r.logger.Debug("outbox flushed", "count", len(batch))
 	}
 	return nil
 }

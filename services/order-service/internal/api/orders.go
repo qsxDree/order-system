@@ -2,30 +2,26 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ordersys/pkg/events"
+	"github.com/ordersys/pkg/outbox"
 	"github.com/ordersys/services/order-service/internal/db"
-	"github.com/ordersys/services/order-service/internal/outbox"
 )
-
-type CreateOrderItemRequest struct {
-	ProductID string  `json:"productId"`
-	SKU       string  `json:"sku"`
-	Quantity  int     `json:"quantity"`
-	UnitPrice float64 `json:"unitPrice"`
-}
 
 type CreateOrderRequest struct {
 	CustomerID string                  `json:"customerId"`
-	Items      []CreateOrderItemRequest `json:"items"`
+	Items      []events.OrderItem      `json:"items"`
 	Address    map[string]any          `json:"address,omitempty"`
 	Currency   string                  `json:"currency"`
 	Simulate   *events.SimulateOptions `json:"simulate,omitempty"`
@@ -123,28 +119,35 @@ func mapOrderResponse(o db.Order, items []db.OrderItem, eventsList []db.OrderEve
 func handleCreateOrder(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req CreateOrderRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			var sizeErr *http.MaxBytesError
+			if errors.As(err, &sizeErr) {
+				http.Error(w, `{"error":"body_too_large"}`, http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, `{"error":"invalid_json"}`, http.StatusBadRequest)
+			}
+			return
+		}
+		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 			http.Error(w, `{"error":"invalid_json"}`, http.StatusBadRequest)
 			return
 		}
-
-		if req.CustomerID == "" || len(req.Items) == 0 {
-			http.Error(w, `{"error":"invalid_body","details":"customerId and items required"}`, http.StatusBadRequest)
+		if req.Currency == "" {
+			req.Currency = "USD"
+		}
+		total, err := events.OrderTotal(req.Items)
+		if err == nil {
+			err = events.ValidateOrder(events.OrderCreatedPayload{
+				OrderID: "pending", CustomerID: req.CustomerID, Items: req.Items,
+				TotalAmount: total, Currency: req.Currency,
+			})
+		}
+		if err != nil {
+			http.Error(w, `{"error":"invalid_body"}`, http.StatusBadRequest)
 			return
-		}
-
-		currency := req.Currency
-		if currency == "" {
-			currency = "USD"
-		}
-
-		var total float64
-		for _, item := range req.Items {
-			if item.Quantity <= 0 || item.UnitPrice < 0 {
-				http.Error(w, `{"error":"invalid_item","details":"positive quantity and non-negative price required"}`, http.StatusBadRequest)
-				return
-			}
-			total += item.UnitPrice * float64(item.Quantity)
 		}
 
 		orderID := uuid.NewString()
@@ -172,7 +175,7 @@ func handleCreateOrder(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 			CustomerID:         req.CustomerID,
 			Status:             "PENDING",
 			TotalAmount:        totalNum,
-			Currency:           currency,
+			Currency:           req.Currency,
 			Address:            addressBytes,
 			InventoryReserved:  false,
 			PaymentSucceeded:   false,
@@ -185,7 +188,6 @@ func handleCreateOrder(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 		}
 
 		insertedItems := make([]db.OrderItem, 0, len(req.Items))
-		eventItems := make([]events.OrderItem, 0, len(req.Items))
 
 		for _, item := range req.Items {
 			var priceNum pgtype.Numeric
@@ -206,30 +208,24 @@ func handleCreateOrder(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 				return
 			}
 			insertedItems = append(insertedItems, dbItem)
-			eventItems = append(eventItems, events.OrderItem{
-				ProductID: item.ProductID,
-				SKU:       item.SKU,
-				Quantity:  item.Quantity,
-				UnitPrice: item.UnitPrice,
-			})
 		}
 
 		eventPayload := events.OrderCreatedPayload{
 			OrderID:     orderID,
 			CustomerID:  req.CustomerID,
-			Items:       eventItems,
+			Items:       req.Items,
 			TotalAmount: total,
-			Currency:    currency,
+			Currency:    req.Currency,
 			Simulate:    req.Simulate,
 		}
 		eventPayloadBytes, _ := json.Marshal(eventPayload)
 
 		_, err = queries.CreateOrderEvent(r.Context(), db.CreateOrderEventParams{
-			ID:        uuid.NewString(),
-			OrderID:   orderID,
-			Type:      events.TypeOrderCreated,
-			Producer:  "order-service",
-			Payload:   eventPayloadBytes,
+			ID:       uuid.NewString(),
+			OrderID:  orderID,
+			Type:     events.TypeOrderCreated,
+			Producer: "order-service",
+			Payload:  eventPayloadBytes,
 		})
 		if err != nil {
 			logger.ErrorContext(r.Context(), "failed to create initial order event", "err", err)
@@ -287,7 +283,12 @@ func handleListOrders(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc 
 
 		resOrders := make([]OrderResponse, 0, len(orders))
 		for _, o := range orders {
-			items, _ := queries.ListOrderItems(r.Context(), o.ID)
+			items, err := queries.ListOrderItems(r.Context(), o.ID)
+			if err != nil {
+				logger.ErrorContext(r.Context(), "failed to list order items", "err", err)
+				http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
+				return
+			}
 			resOrders = append(resOrders, mapOrderResponse(o, items, nil))
 		}
 
@@ -306,13 +307,28 @@ func handleGetOrder(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 
 		queries := db.New(pool)
 		order, err := queries.GetOrder(r.Context(), id)
-		if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
 			return
 		}
+		if err != nil {
+			logger.ErrorContext(r.Context(), "failed to get order", "err", err)
+			http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
+			return
+		}
 
-		items, _ := queries.ListOrderItems(r.Context(), order.ID)
-		eventsList, _ := queries.ListOrderEvents(r.Context(), order.ID)
+		items, err := queries.ListOrderItems(r.Context(), order.ID)
+		if err != nil {
+			logger.ErrorContext(r.Context(), "failed to get order items", "err", err)
+			http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
+			return
+		}
+		eventsList, err := queries.ListOrderEvents(r.Context(), order.ID)
+		if err != nil {
+			logger.ErrorContext(r.Context(), "failed to get order events", "err", err)
+			http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
+			return
+		}
 
 		res := mapOrderResponse(order, items, eventsList)
 		w.Header().Set("Content-Type", "application/json")

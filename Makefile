@@ -6,14 +6,14 @@ help: ## Show this help message
 
 .PHONY: tidy
 tidy: ## Sync Go workspace and tidy all modules
-	go work sync || true
+	go work sync
 	@for s in pkg services/order-service services/inventory-service services/payment-service services/shipping-service services/notification-service tests; do \
-		(cd $$s && go mod tidy) || true; \
+		(cd $$s && go mod tidy) || exit $$?; \
 	done
 
 .PHONY: lint
 lint: ## Run golangci-lint across all modules
-	golangci-lint run pkg/... services/order-service/... services/inventory-service/... services/payment-service/... services/shipping-service/... services/notification-service/... tests/...
+	golangci-lint run ./pkg/... ./services/order-service/... ./services/inventory-service/... ./services/payment-service/... ./services/shipping-service/... ./services/notification-service/... ./tests/...
 
 .PHONY: test
 test: ## Run unit tests across all modules
@@ -29,7 +29,7 @@ build: ## Build all service binaries
 	@for s in order-service inventory-service payment-service shipping-service notification-service; do \
 		if [ -d "services/$$s" ]; then \
 			echo "Building $$s..."; \
-			go build -o bin/$$s ./services/$$s/cmd/server; \
+			go build -o bin/$$s ./services/$$s/cmd/server || exit $$?; \
 		fi \
 	done
 

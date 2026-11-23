@@ -6,13 +6,10 @@ package db
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
 	CreateNotification(ctx context.Context, arg CreateNotificationParams) (Notification, error)
-	ListNotificationsByOrderID(ctx context.Context, orderID pgtype.Text) ([]Notification, error)
 }
 
 var _ Querier = (*Queries)(nil)

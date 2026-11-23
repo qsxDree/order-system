@@ -29,16 +29,6 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   # ---------------- Go Application services ----------------
   order-service:
     build:
@@ -50,14 +40,11 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       LOG_LEVEL: info
       ORDER_PORT: "4001"
       ORDER_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      REDIS_URL: redis://redis:6379
       INVENTORY_URL: http://inventory-service:4002
       PAYMENT_URL: http://payment-service:4003
       SHIPPING_URL: http://shipping-service:4004
@@ -117,7 +104,7 @@ services:
       SHIPPING_PORT: "4004"
       SHIPPING_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/shipping_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      SHIPPING_DELIVERY_DELAY_SEC: "5"
+      DELIVER_AFTER_MS: "5000"
     ports:
       - "4004:4004"
 

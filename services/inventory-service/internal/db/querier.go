@@ -10,18 +10,17 @@ import (
 
 type Querier interface {
 	CreateReservation(ctx context.Context, arg CreateReservationParams) (Reservation, error)
-	GetInventory(ctx context.Context, productID string) (Inventory, error)
-	GetInventoryForUpdate(ctx context.Context, productID string) (Inventory, error)
-	GetProduct(ctx context.Context, id string) (Product, error)
-	GetProductBySKU(ctx context.Context, sku string) (Product, error)
+	GetInventoryForUpdate(ctx context.Context, productID string) (GetInventoryForUpdateRow, error)
+	IsOrderCancelled(ctx context.Context, orderID string) (bool, error)
 	ListHeldReservations(ctx context.Context, orderID string) ([]Reservation, error)
 	ListProductsWithInventory(ctx context.Context) ([]ListProductsWithInventoryRow, error)
+	LockOrder(ctx context.Context, dollar_1 string) error
+	MarkOrderCancelled(ctx context.Context, orderID string) error
 	ReleaseReservation(ctx context.Context, id string) (Reservation, error)
 	ReserveStock(ctx context.Context, arg ReserveStockParams) (Inventory, error)
 	RestoreStock(ctx context.Context, arg RestoreStockParams) (Inventory, error)
-	UpsertInventory(ctx context.Context, arg UpsertInventoryParams) (Inventory, error)
+	SeedInventory(ctx context.Context, arg SeedInventoryParams) error
 	UpsertProduct(ctx context.Context, arg UpsertProductParams) (Product, error)
-	UpsertProductBySKU(ctx context.Context, arg UpsertProductBySKUParams) (Product, error)
 }
 
 var _ Querier = (*Queries)(nil)

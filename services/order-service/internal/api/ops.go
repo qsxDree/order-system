@@ -27,11 +27,11 @@ type HealthResponse struct {
 }
 
 type RabbitQueueRaw struct {
-	Name                    string `json:"name"`
-	Messages                int    `json:"messages"`
-	MessagesReady           int    `json:"messages_ready"`
+	Name                   string `json:"name"`
+	Messages               int    `json:"messages"`
+	MessagesReady          int    `json:"messages_ready"`
 	MessagesUnacknowledged int    `json:"messages_unacknowledged"`
-	Consumers               int    `json:"consumers"`
+	Consumers              int    `json:"consumers"`
 }
 
 type QueueInfo struct {
@@ -170,11 +170,17 @@ func handleReplayDLQ(b *bus.MessageBus, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rawQueue := chi.URLParam(r, "queue")
 		baseQueue := strings.TrimSuffix(rawQueue, ".dlq")
+		switch baseQueue {
+		case "order-service.saga", "inventory-service.events", "payment-service.events", "shipping-service.events", "notification-service.events":
+		default:
+			http.Error(w, `{"error":"invalid_queue"}`, http.StatusBadRequest)
+			return
+		}
 
 		replayed, err := b.ReplayDeadLettered(r.Context(), baseQueue, 50)
 		if err != nil {
 			logger.ErrorContext(r.Context(), "dlq replay failed", "queue", baseQueue, "err", err)
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			http.Error(w, `{"error":"replay_failed"}`, http.StatusInternalServerError)
 			return
 		}
 

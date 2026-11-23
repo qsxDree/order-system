@@ -10,12 +10,6 @@ FROM products p
 LEFT JOIN inventory i ON p.id = i.product_id
 ORDER BY p.sku ASC;
 
--- name: GetProduct :one
-SELECT * FROM products WHERE id = $1 LIMIT 1;
-
--- name: GetProductBySKU :one
-SELECT * FROM products WHERE sku = $1 LIMIT 1;
-
 -- name: UpsertProduct :one
 INSERT INTO products (id, sku, name, price)
 VALUES ($1, $2, $3, $4)
@@ -23,25 +17,15 @@ ON CONFLICT (id) DO UPDATE
 SET name = EXCLUDED.name, price = EXCLUDED.price
 RETURNING *;
 
--- name: UpsertProductBySKU :one
-INSERT INTO products (id, sku, name, price)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (sku) DO UPDATE
-SET name = EXCLUDED.name, price = EXCLUDED.price
-RETURNING *;
-
--- name: GetInventory :one
-SELECT * FROM inventory WHERE product_id = $1 LIMIT 1;
-
 -- name: GetInventoryForUpdate :one
-SELECT * FROM inventory WHERE product_id = $1 LIMIT 1 FOR UPDATE;
+SELECT i.*, p.sku, p.price FROM inventory i
+JOIN products p ON p.id = i.product_id
+WHERE i.product_id = $1 LIMIT 1 FOR UPDATE OF i;
 
--- name: UpsertInventory :one
+-- name: SeedInventory :exec
 INSERT INTO inventory (product_id, available, reserved)
 VALUES ($1, $2, $3)
-ON CONFLICT (product_id) DO UPDATE
-SET available = EXCLUDED.available, reserved = EXCLUDED.reserved
-RETURNING *;
+ON CONFLICT (product_id) DO NOTHING;
 
 -- name: ReserveStock :one
 UPDATE inventory
@@ -56,7 +40,8 @@ RETURNING *;
 
 -- name: ListHeldReservations :many
 SELECT * FROM reservations
-WHERE order_id = $1 AND status = 'HELD';
+WHERE order_id = $1 AND status = 'HELD'
+ORDER BY product_id FOR UPDATE;
 
 -- name: ReleaseReservation :one
 UPDATE reservations
@@ -69,3 +54,13 @@ UPDATE inventory
 SET available = available + $1, reserved = reserved - $1
 WHERE product_id = $2
 RETURNING *;
+
+-- name: LockOrder :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
+
+-- name: IsOrderCancelled :one
+SELECT EXISTS(SELECT 1 FROM order_cancellations WHERE order_id = $1);
+
+-- name: MarkOrderCancelled :exec
+INSERT INTO order_cancellations (order_id) VALUES ($1)
+ON CONFLICT (order_id) DO NOTHING;

@@ -19,7 +19,6 @@ type MgmtConfig struct {
 }
 
 type Config struct {
-	ServiceName string
 	Port        int
 	DatabaseURL string
 	RabbitMQURL string
@@ -46,7 +45,6 @@ func Load() Config {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
 	return Config{
-		ServiceName: getEnv("SERVICE_NAME", "order-service"),
 		Port:        port,
 		DatabaseURL: dbURL,
 		RabbitMQURL: rabbitURL,

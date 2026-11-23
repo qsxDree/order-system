@@ -6,12 +6,14 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
-	GetShipmentByOrderID(ctx context.Context, orderID string) (Shipment, error)
+	CreateShipment(ctx context.Context, arg CreateShipmentParams) (Shipment, error)
+	ListDueShipments(ctx context.Context, updatedAt pgtype.Timestamptz) ([]Shipment, error)
 	UpdateShipmentStatus(ctx context.Context, arg UpdateShipmentStatusParams) (Shipment, error)
-	UpsertShipment(ctx context.Context, arg UpsertShipmentParams) (Shipment, error)
 }
 
 var _ Querier = (*Queries)(nil)

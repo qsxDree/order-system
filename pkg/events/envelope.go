@@ -2,6 +2,8 @@ package events
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,6 +87,16 @@ func ParseRaw(data []byte) (*RawEnvelope, error) {
 	var env RawEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(env.MessageID) == "" || strings.TrimSpace(env.CorrelationID) == "" ||
+		strings.TrimSpace(env.Type) == "" || strings.TrimSpace(env.Producer) == "" || env.Version != 1 {
+		return nil, fmt.Errorf("invalid event envelope: identity, type, producer and version 1 are required")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, env.OccurredAt); err != nil {
+		return nil, fmt.Errorf("invalid event timestamp: %w", err)
+	}
+	if len(env.Data) == 0 || string(env.Data) == "null" || env.Data[0] != '{' {
+		return nil, fmt.Errorf("event data must be a JSON object")
 	}
 	return &env, nil
 }

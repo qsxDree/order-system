@@ -97,6 +97,23 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    aggregate_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    correlation_id TEXT NOT NULL,
+    causation_id TEXT,
+    published BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_published_created_at ON outbox(published, created_at);
+
+CREATE TABLE IF NOT EXISTS order_cancellations (
+    order_id TEXT PRIMARY KEY
+);
+
 \connect payment_db;
 
 CREATE TABLE IF NOT EXISTS payments (
@@ -118,6 +135,23 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    aggregate_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    correlation_id TEXT NOT NULL,
+    causation_id TEXT,
+    published BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_published_created_at ON outbox(published, created_at);
+
+CREATE TABLE IF NOT EXISTS order_cancellations (
+    order_id TEXT PRIMARY KEY
+);
+
 \connect shipping_db;
 
 CREATE TABLE IF NOT EXISTS shipments (
@@ -134,6 +168,20 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     type TEXT NOT NULL,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    aggregate_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    correlation_id TEXT NOT NULL,
+    causation_id TEXT,
+    published BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_published_created_at ON outbox(published, created_at);
+
 
 \connect notification_db;
 

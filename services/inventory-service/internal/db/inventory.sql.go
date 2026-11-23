@@ -45,63 +45,48 @@ func (q *Queries) CreateReservation(ctx context.Context, arg CreateReservationPa
 	return i, err
 }
 
-const getInventory = `-- name: GetInventory :one
-SELECT product_id, available, reserved FROM inventory WHERE product_id = $1 LIMIT 1
-`
-
-func (q *Queries) GetInventory(ctx context.Context, productID string) (Inventory, error) {
-	row := q.db.QueryRow(ctx, getInventory, productID)
-	var i Inventory
-	err := row.Scan(&i.ProductID, &i.Available, &i.Reserved)
-	return i, err
-}
-
 const getInventoryForUpdate = `-- name: GetInventoryForUpdate :one
-SELECT product_id, available, reserved FROM inventory WHERE product_id = $1 LIMIT 1 FOR UPDATE
+SELECT i.product_id, i.available, i.reserved, p.sku, p.price FROM inventory i
+JOIN products p ON p.id = i.product_id
+WHERE i.product_id = $1 LIMIT 1 FOR UPDATE OF i
 `
 
-func (q *Queries) GetInventoryForUpdate(ctx context.Context, productID string) (Inventory, error) {
+type GetInventoryForUpdateRow struct {
+	ProductID string         `json:"product_id"`
+	Available int32          `json:"available"`
+	Reserved  int32          `json:"reserved"`
+	Sku       string         `json:"sku"`
+	Price     pgtype.Numeric `json:"price"`
+}
+
+func (q *Queries) GetInventoryForUpdate(ctx context.Context, productID string) (GetInventoryForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getInventoryForUpdate, productID)
-	var i Inventory
-	err := row.Scan(&i.ProductID, &i.Available, &i.Reserved)
-	return i, err
-}
-
-const getProduct = `-- name: GetProduct :one
-SELECT id, sku, name, price FROM products WHERE id = $1 LIMIT 1
-`
-
-func (q *Queries) GetProduct(ctx context.Context, id string) (Product, error) {
-	row := q.db.QueryRow(ctx, getProduct, id)
-	var i Product
+	var i GetInventoryForUpdateRow
 	err := row.Scan(
-		&i.ID,
+		&i.ProductID,
+		&i.Available,
+		&i.Reserved,
 		&i.Sku,
-		&i.Name,
 		&i.Price,
 	)
 	return i, err
 }
 
-const getProductBySKU = `-- name: GetProductBySKU :one
-SELECT id, sku, name, price FROM products WHERE sku = $1 LIMIT 1
+const isOrderCancelled = `-- name: IsOrderCancelled :one
+SELECT EXISTS(SELECT 1 FROM order_cancellations WHERE order_id = $1)
 `
 
-func (q *Queries) GetProductBySKU(ctx context.Context, sku string) (Product, error) {
-	row := q.db.QueryRow(ctx, getProductBySKU, sku)
-	var i Product
-	err := row.Scan(
-		&i.ID,
-		&i.Sku,
-		&i.Name,
-		&i.Price,
-	)
-	return i, err
+func (q *Queries) IsOrderCancelled(ctx context.Context, orderID string) (bool, error) {
+	row := q.db.QueryRow(ctx, isOrderCancelled, orderID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const listHeldReservations = `-- name: ListHeldReservations :many
 SELECT id, order_id, product_id, quantity, status, created_at FROM reservations
 WHERE order_id = $1 AND status = 'HELD'
+ORDER BY product_id FOR UPDATE
 `
 
 func (q *Queries) ListHeldReservations(ctx context.Context, orderID string) ([]Reservation, error) {
@@ -180,6 +165,25 @@ func (q *Queries) ListProductsWithInventory(ctx context.Context) ([]ListProducts
 	return items, nil
 }
 
+const lockOrder = `-- name: LockOrder :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
+`
+
+func (q *Queries) LockOrder(ctx context.Context, dollar_1 string) error {
+	_, err := q.db.Exec(ctx, lockOrder, dollar_1)
+	return err
+}
+
+const markOrderCancelled = `-- name: MarkOrderCancelled :exec
+INSERT INTO order_cancellations (order_id) VALUES ($1)
+ON CONFLICT (order_id) DO NOTHING
+`
+
+func (q *Queries) MarkOrderCancelled(ctx context.Context, orderID string) error {
+	_, err := q.db.Exec(ctx, markOrderCancelled, orderID)
+	return err
+}
+
 const releaseReservation = `-- name: ReleaseReservation :one
 UPDATE reservations
 SET status = 'RELEASED'
@@ -239,25 +243,21 @@ func (q *Queries) RestoreStock(ctx context.Context, arg RestoreStockParams) (Inv
 	return i, err
 }
 
-const upsertInventory = `-- name: UpsertInventory :one
+const seedInventory = `-- name: SeedInventory :exec
 INSERT INTO inventory (product_id, available, reserved)
 VALUES ($1, $2, $3)
-ON CONFLICT (product_id) DO UPDATE
-SET available = EXCLUDED.available, reserved = EXCLUDED.reserved
-RETURNING product_id, available, reserved
+ON CONFLICT (product_id) DO NOTHING
 `
 
-type UpsertInventoryParams struct {
+type SeedInventoryParams struct {
 	ProductID string `json:"product_id"`
 	Available int32  `json:"available"`
 	Reserved  int32  `json:"reserved"`
 }
 
-func (q *Queries) UpsertInventory(ctx context.Context, arg UpsertInventoryParams) (Inventory, error) {
-	row := q.db.QueryRow(ctx, upsertInventory, arg.ProductID, arg.Available, arg.Reserved)
-	var i Inventory
-	err := row.Scan(&i.ProductID, &i.Available, &i.Reserved)
-	return i, err
+func (q *Queries) SeedInventory(ctx context.Context, arg SeedInventoryParams) error {
+	_, err := q.db.Exec(ctx, seedInventory, arg.ProductID, arg.Available, arg.Reserved)
+	return err
 }
 
 const upsertProduct = `-- name: UpsertProduct :one
@@ -277,38 +277,6 @@ type UpsertProductParams struct {
 
 func (q *Queries) UpsertProduct(ctx context.Context, arg UpsertProductParams) (Product, error) {
 	row := q.db.QueryRow(ctx, upsertProduct,
-		arg.ID,
-		arg.Sku,
-		arg.Name,
-		arg.Price,
-	)
-	var i Product
-	err := row.Scan(
-		&i.ID,
-		&i.Sku,
-		&i.Name,
-		&i.Price,
-	)
-	return i, err
-}
-
-const upsertProductBySKU = `-- name: UpsertProductBySKU :one
-INSERT INTO products (id, sku, name, price)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (sku) DO UPDATE
-SET name = EXCLUDED.name, price = EXCLUDED.price
-RETURNING id, sku, name, price
-`
-
-type UpsertProductBySKUParams struct {
-	ID    string         `json:"id"`
-	Sku   string         `json:"sku"`
-	Name  string         `json:"name"`
-	Price pgtype.Numeric `json:"price"`
-}
-
-func (q *Queries) UpsertProductBySKU(ctx context.Context, arg UpsertProductBySKUParams) (Product, error) {
-	row := q.db.QueryRow(ctx, upsertProductBySKU,
 		arg.ID,
 		arg.Sku,
 		arg.Name,

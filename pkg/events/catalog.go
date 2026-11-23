@@ -43,21 +43,14 @@ func IsValidEventType(eventType string) bool {
 
 // UnmarshalPayload unmarshals raw JSON into the corresponding typed event payload struct.
 func UnmarshalPayload(eventType string, raw []byte) (any, error) {
-	if !IsValidEventType(eventType) {
-		return nil, fmt.Errorf("unknown event type: %q", eventType)
-	}
-
 	switch eventType {
 	case TypeOrderCreated:
 		var p OrderCreatedPayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal %s: %w", eventType, err)
 		}
-		if len(p.Items) == 0 {
-			return nil, fmt.Errorf("%s payload requires at least one item", eventType)
-		}
-		if p.OrderID == "" || p.CustomerID == "" {
-			return nil, fmt.Errorf("%s payload requires orderId and customerId", eventType)
+		if err := ValidateOrder(p); err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", eventType, err)
 		}
 		return p, nil
 

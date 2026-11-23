@@ -10,7 +10,9 @@ import (
 
 type Querier interface {
 	CreatePayment(ctx context.Context, arg CreatePaymentParams) (Payment, error)
-	GetPayment(ctx context.Context, id string) (Payment, error)
+	IsOrderCancelled(ctx context.Context, orderID string) (bool, error)
+	LockOrder(ctx context.Context, dollar_1 string) error
+	MarkOrderCancelled(ctx context.Context, orderID string) error
 	RefundPaymentByOrderID(ctx context.Context, orderID string) ([]Payment, error)
 	UpdatePaymentStatus(ctx context.Context, arg UpdatePaymentStatusParams) (Payment, error)
 }

@@ -39,36 +39,3 @@ func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotification
 	)
 	return i, err
 }
-
-const listNotificationsByOrderID = `-- name: ListNotificationsByOrderID :many
-SELECT id, order_id, channel, template, status, sent_at FROM notifications
-WHERE order_id = $1
-ORDER BY sent_at DESC
-`
-
-func (q *Queries) ListNotificationsByOrderID(ctx context.Context, orderID pgtype.Text) ([]Notification, error) {
-	rows, err := q.db.Query(ctx, listNotificationsByOrderID, orderID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []Notification
-	for rows.Next() {
-		var i Notification
-		if err := rows.Scan(
-			&i.ID,
-			&i.OrderID,
-			&i.Channel,
-			&i.Template,
-			&i.Status,
-			&i.SentAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}

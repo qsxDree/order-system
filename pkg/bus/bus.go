@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -48,12 +49,15 @@ type Config struct {
 
 // MessageBus encapsulates RabbitMQ connection, channel, publishing, and subscription management.
 type MessageBus struct {
-	cfg     Config
-	conn    *amqp.Connection
-	pubChan *amqp.Channel
-	pubMu   sync.Mutex
-	closed  bool
-	mu      sync.Mutex
+	cfg        Config
+	conn       *amqp.Connection
+	pubChan    *amqp.Channel
+	pubReturns <-chan amqp.Return
+	pubMu      sync.Mutex
+	closed     bool
+	mu         sync.Mutex
+	done       chan struct{}
+	stopped    sync.Once
 }
 
 // NewMessageBus creates a new MessageBus instance.
@@ -62,7 +66,8 @@ func NewMessageBus(cfg Config) *MessageBus {
 		cfg.Logger = slog.Default()
 	}
 	return &MessageBus{
-		cfg: cfg,
+		cfg:  cfg,
+		done: make(chan struct{}),
 	}
 }
 
@@ -77,58 +82,97 @@ func (b *MessageBus) Connect(ctx context.Context, retries int, delay time.Durati
 
 	var lastErr error
 	for attempt := 1; attempt <= retries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		conn, err := amqp.Dial(b.cfg.URL)
+		conn, err := amqp.DialConfig(b.cfg.URL, amqp.Config{
+			Dial: func(network, address string) (net.Conn, error) {
+				conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					_ = conn.Close()
+					return nil, err
+				}
+				return conn, nil
+			},
+		})
 		if err == nil {
-			ch, err := conn.Channel()
-			if err != nil {
-				_ = conn.Close()
-				lastErr = err
-				b.cfg.Logger.Warn("failed to open publisher channel, retrying...", "attempt", attempt, "err", err)
-				time.Sleep(delay)
-				continue
+			var ch *amqp.Channel
+			ch, err = conn.Channel()
+			if err == nil {
+				err = ch.ExchangeDeclare(ExchangeName, "topic", true, false, false, false, nil)
 			}
-
-			// Declare durable topic exchange
-			err = ch.ExchangeDeclare(
-				ExchangeName,
-				"topic",
-				true,  // durable
-				false, // auto-deleted
-				false, // internal
-				false, // no-wait
-				nil,   // arguments
-			)
-			if err != nil {
-				_ = ch.Close()
-				_ = conn.Close()
-				lastErr = err
-				b.cfg.Logger.Warn("failed to declare exchange, retrying...", "attempt", attempt, "err", err)
-				time.Sleep(delay)
-				continue
+			var returns <-chan amqp.Return
+			if err == nil {
+				returns, err = enableConfirms(ch)
 			}
-
-			b.mu.Lock()
-			b.conn = conn
-			b.pubChan = ch
-			b.closed = false
-			b.mu.Unlock()
-
-			b.cfg.Logger.Info("connected to RabbitMQ", "exchange", ExchangeName)
-			return nil
+			if err == nil {
+				b.pubMu.Lock()
+				b.mu.Lock()
+				b.conn, b.pubChan, b.pubReturns, b.closed = conn, ch, returns, false
+				b.mu.Unlock()
+				b.pubMu.Unlock()
+				closed := conn.NotifyClose(make(chan *amqp.Error, 1))
+				go func() {
+					if err := <-closed; err != nil {
+						b.cfg.Logger.Error("RabbitMQ connection closed", "err", err)
+					}
+					b.stopped.Do(func() { close(b.done) })
+				}()
+				b.cfg.Logger.Info("connected to RabbitMQ", "exchange", ExchangeName)
+				return nil
+			}
+			_ = conn.Close()
 		}
-
 		lastErr = err
-		b.cfg.Logger.Warn("RabbitMQ not ready, retrying...", "attempt", attempt, "max", retries, "err", err)
-		time.Sleep(delay)
+		b.cfg.Logger.Warn("RabbitMQ connection failed", "attempt", attempt, "err", err)
+		if attempt < retries {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
-
 	return fmt.Errorf("could not connect to RabbitMQ after %d attempts: %w", retries, lastErr)
+}
+
+// Done closes when the broker connection or an active consumer stops.
+func (b *MessageBus) Done() <-chan struct{} { return b.done }
+
+func enableConfirms(ch *amqp.Channel) (<-chan amqp.Return, error) {
+	if err := ch.Confirm(false); err != nil {
+		return nil, err
+	}
+	return ch.NotifyReturn(make(chan amqp.Return, 1)), nil
+}
+
+func publishConfirmed(ctx context.Context, ch *amqp.Channel, returns <-chan amqp.Return,
+	exchange, key string, msg amqp.Publishing) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	confirmation, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, true, false, msg)
+	if err != nil {
+		return err
+	}
+	acked, err := confirmation.WaitContext(ctx)
+	if err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("waiting for publisher confirmation: %w", err)
+	}
+	if !acked {
+		return errors.New("broker did not confirm publication")
+	}
+	select {
+	case returned := <-returns:
+		return fmt.Errorf("unroutable publication to %s: %s", key, returned.ReplyText)
+	default:
+		return nil
+	}
 }
 
 // Publish publishes a typed payload wrapped in an EventEnvelope to the orders.topic exchange.
@@ -136,8 +180,23 @@ func (b *MessageBus) Publish(ctx context.Context, eventType string, data any, op
 	b.pubMu.Lock()
 	defer b.pubMu.Unlock()
 
-	if b.pubChan == nil {
-		return "", errors.New("message bus not connected — call Connect first")
+	b.mu.Lock()
+	conn, closed := b.conn, b.closed
+	b.mu.Unlock()
+	if conn == nil || closed || conn.IsClosed() {
+		return "", errors.New("message bus not connected")
+	}
+	if b.pubChan == nil || b.pubChan.IsClosed() {
+		ch, err := conn.Channel()
+		if err != nil {
+			return "", err
+		}
+		returns, err := enableConfirms(ch)
+		if err != nil {
+			_ = ch.Close()
+			return "", err
+		}
+		b.pubChan, b.pubReturns = ch, returns
 	}
 
 	var opt PublishOptions
@@ -179,14 +238,7 @@ func (b *MessageBus) Publish(ctx context.Context, eventType string, data any, op
 		Body:          body,
 	}
 
-	err = b.pubChan.PublishWithContext(
-		ctx,
-		ExchangeName,
-		eventType,
-		false, // mandatory
-		false, // immediate
-		pub,
-	)
+	err = publishConfirmed(ctx, b.pubChan, b.pubReturns, ExchangeName, eventType, pub)
 	if err != nil {
 		return "", fmt.Errorf("failed to publish event: %w", err)
 	}
@@ -203,6 +255,9 @@ func (b *MessageBus) Publish(ctx context.Context, eventType string, data any, op
 
 // Subscribe declares the main queue, retry queue, and DLQ, then begins processing messages.
 func (b *MessageBus) Subscribe(ctx context.Context, opts SubscribeOptions) error {
+	if opts.Queue == "" || len(opts.RoutingKeys) == 0 || opts.Handler == nil {
+		return errors.New("queue, routing keys and handler are required")
+	}
 	b.mu.Lock()
 	conn := b.conn
 	b.mu.Unlock()
@@ -214,6 +269,12 @@ func (b *MessageBus) Subscribe(ctx context.Context, opts SubscribeOptions) error
 	ch, err := conn.Channel()
 	if err != nil {
 		return fmt.Errorf("failed to open consumer channel: %w", err)
+	}
+
+	returns, err := enableConfirms(ch)
+	if err != nil {
+		_ = ch.Close()
+		return err
 	}
 
 	prefetch := opts.Prefetch
@@ -287,13 +348,14 @@ func (b *MessageBus) Subscribe(ctx context.Context, opts SubscribeOptions) error
 		"maxRetries", maxRetries,
 	)
 
-	go b.consumeLoop(ctx, ch, deliveries, queue, retryQueue, dlq, maxRetries, opts.Handler)
+	go b.consumeLoop(ctx, ch, returns, deliveries, queue, retryQueue, dlq, maxRetries, opts.Handler)
 	return nil
 }
 
 func (b *MessageBus) consumeLoop(
 	ctx context.Context,
 	ch *amqp.Channel,
+	returns <-chan amqp.Return,
 	deliveries <-chan amqp.Delivery,
 	queue, retryQueue, dlq string,
 	maxRetries int,
@@ -309,9 +371,13 @@ func (b *MessageBus) consumeLoop(
 			return
 		case msg, ok := <-deliveries:
 			if !ok {
+				if ctx.Err() == nil {
+					b.cfg.Logger.ErrorContext(ctx, "consumer stopped unexpectedly", "queue", queue)
+					b.stopped.Do(func() { close(b.done) })
+				}
 				return
 			}
-			b.handleDelivery(ctx, ch, msg, queue, retryQueue, dlq, maxRetries, handler)
+			b.handleDelivery(ctx, ch, returns, msg, queue, retryQueue, dlq, maxRetries, handler)
 		}
 	}
 }
@@ -319,6 +385,7 @@ func (b *MessageBus) consumeLoop(
 func (b *MessageBus) handleDelivery(
 	ctx context.Context,
 	ch *amqp.Channel,
+	returns <-chan amqp.Return,
 	msg amqp.Delivery,
 	queue, retryQueue, dlq string,
 	maxRetries int,
@@ -338,7 +405,7 @@ func (b *MessageBus) handleDelivery(
 		headers["x-error"] = "unprocessable"
 		headers["x-original-queue"] = queue
 
-		_ = ch.PublishWithContext(ctx, "", dlq, false, false, amqp.Publishing{
+		b.forwardDelivery(ctx, ch, returns, msg, dlq, amqp.Publishing{
 			DeliveryMode:  amqp.Persistent,
 			Headers:       headers,
 			Body:          msg.Body,
@@ -346,7 +413,6 @@ func (b *MessageBus) handleDelivery(
 			CorrelationId: msg.CorrelationId,
 			Type:          msg.Type,
 		})
-		_ = msg.Ack(false)
 		return
 	}
 
@@ -403,7 +469,7 @@ func (b *MessageBus) handleDelivery(
 		)
 
 		forwardPub.Expiration = fmt.Sprintf("%d", delay.Milliseconds())
-		_ = ch.PublishWithContext(ctx, "", retryQueue, false, false, forwardPub)
+		b.forwardDelivery(ctx, ch, returns, msg, retryQueue, forwardPub)
 		metrics.EventsConsumedTotal.WithLabelValues(rawEnv.Type, queue, "retry").Inc()
 	} else {
 		b.cfg.Logger.ErrorContext(msgCtx, "retries exhausted -> sending to DLQ",
@@ -415,27 +481,44 @@ func (b *MessageBus) handleDelivery(
 		headers["x-original-queue"] = queue
 		forwardPub.Headers = headers
 
-		_ = ch.PublishWithContext(ctx, "", dlq, false, false, forwardPub)
+		b.forwardDelivery(ctx, ch, returns, msg, dlq, forwardPub)
 		metrics.EventsConsumedTotal.WithLabelValues(rawEnv.Type, queue, "dlq").Inc()
 	}
 
-	_ = msg.Ack(false)
 }
 
-// ReplayDeadLettered pulls up to limit messages from queue.dlq and re-publishes them to orders.topic.
-func (b *MessageBus) ReplayDeadLettered(ctx context.Context, queue string, limit int) (int, error) {
-	b.pubMu.Lock()
-	defer b.pubMu.Unlock()
+func (b *MessageBus) forwardDelivery(ctx context.Context, ch *amqp.Channel, returns <-chan amqp.Return,
+	msg amqp.Delivery, queue string, publication amqp.Publishing) {
+	if err := publishConfirmed(ctx, ch, returns, "", queue, publication); err != nil {
+		b.cfg.Logger.ErrorContext(ctx, "forwarding failed; retaining original delivery", "queue", queue, "err", err)
+		_ = msg.Nack(false, true)
+		return
+	}
+	if err := msg.Ack(false); err != nil {
+		b.cfg.Logger.ErrorContext(ctx, "failed to acknowledge forwarded delivery", "err", err)
+	}
+}
 
-	if b.conn == nil {
+// ReplayDeadLettered returns dead letters only to their original queue, with a fresh retry budget.
+func (b *MessageBus) ReplayDeadLettered(ctx context.Context, queue string, limit int) (int, error) {
+	b.mu.Lock()
+	conn := b.conn
+	b.mu.Unlock()
+	if conn == nil {
 		return 0, errors.New("message bus not connected")
 	}
-
-	ch, err := b.conn.Channel()
+	ch, err := conn.Channel()
 	if err != nil {
 		return 0, fmt.Errorf("failed to open replay channel: %w", err)
 	}
 	defer func() { _ = ch.Close() }()
+	returns, err := enableConfirms(ch)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := ch.QueueDeclarePassive(queue, true, false, false, false, nil); err != nil {
+		return 0, fmt.Errorf("replay target queue does not exist: %w", err)
+	}
 
 	if limit <= 0 {
 		limit = 50
@@ -453,27 +536,19 @@ func (b *MessageBus) ReplayDeadLettered(ctx context.Context, queue string, limit
 			break
 		}
 
-		eventType := msg.Type
-		if eventType == "" {
-			var raw events.RawEnvelope
-			if err := json.Unmarshal(msg.Body, &raw); err == nil {
-				eventType = raw.Type
-			}
-		}
-
-		err = ch.PublishWithContext(ctx, ExchangeName, eventType, false, false, amqp.Publishing{
-			DeliveryMode:  amqp.Persistent,
-			MessageId:     msg.MessageId,
-			CorrelationId: msg.CorrelationId,
-			Type:          eventType,
-			Body:          msg.Body,
+		err = publishConfirmed(ctx, ch, returns, "", queue, amqp.Publishing{
+			DeliveryMode: amqp.Persistent, ContentType: msg.ContentType,
+			MessageId: msg.MessageId, CorrelationId: msg.CorrelationId,
+			Type: msg.Type, Body: msg.Body, Timestamp: msg.Timestamp,
 		})
 		if err != nil {
 			_ = msg.Nack(false, true)
 			return count, fmt.Errorf("failed to republish dlq message: %w", err)
 		}
 
-		_ = msg.Ack(false)
+		if err := msg.Ack(false); err != nil {
+			return count, fmt.Errorf("failed to acknowledge replay: %w", err)
+		}
 		count++
 	}
 
@@ -485,6 +560,8 @@ func (b *MessageBus) ReplayDeadLettered(ctx context.Context, queue string, limit
 
 // Close gracefully closes the publisher channel and connection.
 func (b *MessageBus) Close() error {
+	b.pubMu.Lock()
+	defer b.pubMu.Unlock()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

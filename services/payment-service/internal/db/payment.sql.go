@@ -42,24 +42,34 @@ func (q *Queries) CreatePayment(ctx context.Context, arg CreatePaymentParams) (P
 	return i, err
 }
 
-const getPayment = `-- name: GetPayment :one
-SELECT id, order_id, amount, status, provider_ref, failure_code, created_at, updated_at FROM payments WHERE id = $1 LIMIT 1
+const isOrderCancelled = `-- name: IsOrderCancelled :one
+SELECT EXISTS(SELECT 1 FROM order_cancellations WHERE order_id = $1)
 `
 
-func (q *Queries) GetPayment(ctx context.Context, id string) (Payment, error) {
-	row := q.db.QueryRow(ctx, getPayment, id)
-	var i Payment
-	err := row.Scan(
-		&i.ID,
-		&i.OrderID,
-		&i.Amount,
-		&i.Status,
-		&i.ProviderRef,
-		&i.FailureCode,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
+func (q *Queries) IsOrderCancelled(ctx context.Context, orderID string) (bool, error) {
+	row := q.db.QueryRow(ctx, isOrderCancelled, orderID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const lockOrder = `-- name: LockOrder :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
+`
+
+func (q *Queries) LockOrder(ctx context.Context, dollar_1 string) error {
+	_, err := q.db.Exec(ctx, lockOrder, dollar_1)
+	return err
+}
+
+const markOrderCancelled = `-- name: MarkOrderCancelled :exec
+INSERT INTO order_cancellations (order_id) VALUES ($1)
+ON CONFLICT (order_id) DO NOTHING
+`
+
+func (q *Queries) MarkOrderCancelled(ctx context.Context, orderID string) error {
+	_, err := q.db.Exec(ctx, markOrderCancelled, orderID)
+	return err
 }
 
 const refundPaymentByOrderID = `-- name: RefundPaymentByOrderID :many

@@ -35,6 +35,9 @@ func (c *NotificationConsumer) HandleMessage(ctx context.Context, raw *events.Ra
 	if err := json.Unmarshal(raw.Data, &helper); err != nil {
 		return fmt.Errorf("failed to extract orderId from event data: %w", err)
 	}
+	if _, err := events.UnmarshalPayload(raw.Type, raw.Data); err != nil {
+		return err
+	}
 
 	tmpl := GetTemplate(raw.Type)
 

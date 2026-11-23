@@ -196,47 +196,6 @@ func (q *Queries) CreateOrderItem(ctx context.Context, arg CreateOrderItemParams
 	return i, err
 }
 
-const createOutbox = `-- name: CreateOutbox :one
-INSERT INTO outbox (
-    id, aggregate_id, type, payload, correlation_id, causation_id, published, created_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, false, NOW()
-)
-RETURNING id, aggregate_id, type, payload, correlation_id, causation_id, published, created_at
-`
-
-type CreateOutboxParams struct {
-	ID            string      `json:"id"`
-	AggregateID   string      `json:"aggregate_id"`
-	Type          string      `json:"type"`
-	Payload       []byte      `json:"payload"`
-	CorrelationID string      `json:"correlation_id"`
-	CausationID   pgtype.Text `json:"causation_id"`
-}
-
-func (q *Queries) CreateOutbox(ctx context.Context, arg CreateOutboxParams) (Outbox, error) {
-	row := q.db.QueryRow(ctx, createOutbox,
-		arg.ID,
-		arg.AggregateID,
-		arg.Type,
-		arg.Payload,
-		arg.CorrelationID,
-		arg.CausationID,
-	)
-	var i Outbox
-	err := row.Scan(
-		&i.ID,
-		&i.AggregateID,
-		&i.Type,
-		&i.Payload,
-		&i.CorrelationID,
-		&i.CausationID,
-		&i.Published,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
 const getOrder = `-- name: GetOrder :one
 SELECT id, customer_id, status, total_amount, currency, address, inventory_reserved, payment_succeeded, cancellation_reason, created_at, updated_at FROM orders WHERE id = $1 LIMIT 1
 `
@@ -366,52 +325,24 @@ func (q *Queries) ListOrders(ctx context.Context, arg ListOrdersParams) ([]Order
 	return items, nil
 }
 
-const markOutboxPublished = `-- name: MarkOutboxPublished :exec
-UPDATE outbox
-SET published = true
-WHERE id = $1
+const markOrderDelivered = `-- name: MarkOrderDelivered :exec
+UPDATE orders SET status = 'DELIVERED', updated_at = NOW()
+WHERE id = $1 AND status IN ('CONFIRMED', 'SHIPPED')
 `
 
-func (q *Queries) MarkOutboxPublished(ctx context.Context, id string) error {
-	_, err := q.db.Exec(ctx, markOutboxPublished, id)
+func (q *Queries) MarkOrderDelivered(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markOrderDelivered, id)
 	return err
 }
 
-const pollUnpublishedOutbox = `-- name: PollUnpublishedOutbox :many
-SELECT id, aggregate_id, type, payload, correlation_id, causation_id, published, created_at FROM outbox
-WHERE published = false
-ORDER BY created_at ASC
-LIMIT $1
-FOR UPDATE SKIP LOCKED
+const markOrderShipped = `-- name: MarkOrderShipped :exec
+UPDATE orders SET status = 'SHIPPED', updated_at = NOW()
+WHERE id = $1 AND status = 'CONFIRMED'
 `
 
-func (q *Queries) PollUnpublishedOutbox(ctx context.Context, limit int32) ([]Outbox, error) {
-	rows, err := q.db.Query(ctx, pollUnpublishedOutbox, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []Outbox
-	for rows.Next() {
-		var i Outbox
-		if err := rows.Scan(
-			&i.ID,
-			&i.AggregateID,
-			&i.Type,
-			&i.Payload,
-			&i.CorrelationID,
-			&i.CausationID,
-			&i.Published,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+func (q *Queries) MarkOrderShipped(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markOrderShipped, id)
+	return err
 }
 
 const updateOrderInventoryReserved = `-- name: UpdateOrderInventoryReserved :one
@@ -449,38 +380,6 @@ RETURNING id, customer_id, status, total_amount, currency, address, inventory_re
 
 func (q *Queries) UpdateOrderPaymentSucceeded(ctx context.Context, id string) (Order, error) {
 	row := q.db.QueryRow(ctx, updateOrderPaymentSucceeded, id)
-	var i Order
-	err := row.Scan(
-		&i.ID,
-		&i.CustomerID,
-		&i.Status,
-		&i.TotalAmount,
-		&i.Currency,
-		&i.Address,
-		&i.InventoryReserved,
-		&i.PaymentSucceeded,
-		&i.CancellationReason,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const updateOrderStatus = `-- name: UpdateOrderStatus :one
-UPDATE orders
-SET status = $2, updated_at = NOW()
-WHERE id = $1 AND status = $3
-RETURNING id, customer_id, status, total_amount, currency, address, inventory_reserved, payment_succeeded, cancellation_reason, created_at, updated_at
-`
-
-type UpdateOrderStatusParams struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Status_2 string `json:"status_2"`
-}
-
-func (q *Queries) UpdateOrderStatus(ctx context.Context, arg UpdateOrderStatusParams) (Order, error) {
-	row := q.db.QueryRow(ctx, updateOrderStatus, arg.ID, arg.Status, arg.Status_2)
 	var i Order
 	err := row.Scan(
 		&i.ID,
